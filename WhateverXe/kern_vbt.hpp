@@ -124,7 +124,24 @@ inline Ports parse(const void *data,size_t length,Family family) {
         if(!type)continue; // disabled firmware entry is not a wired connector
         const auto d=ddi(family,c[16]);
         if(d==PortCount){++r.unmapped;continue;}
-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+        if(r.present&(1U<<d)) {
+            // MSI Katana 17 B13VFK VBT 249: two firmware children claim
+            // Combo A/AUX A. Keep the internal eDP child and ignore only
+            // the measured, later DP-only duplicate. Reject all other
+            // duplicates as before. This is experimental hardware support.
+            const auto &existing=r.port[d];
+            const bool msiKatanaPortADuplicate =
+                family==Family::RaptorLakeP &&
+                r.version==249 && stride==39 && d==0 &&
+                existing.type==0x1806 && existing.dvo==10 &&
+                existing.ddc==0x03 && existing.aux==0x40 &&
+                existing.flags==0xC0 && existing.capabilities==0 &&
+                u16(c)==0x0004 && type==0x68C6 && c[16]==10 &&
+                c[19]==0x01 && c[25]==0x40 &&
+                c[23]==0xC0 && c[33]==0;
+            if(msiKatanaPortADuplicate)continue;
+            r.status=Status::Conflict;return r;
+        }
         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
