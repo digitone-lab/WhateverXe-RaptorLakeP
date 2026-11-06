@@ -225,6 +225,10 @@ static bool xelpPanelPolicy() {
 // Detailed read-only display evidence is opt-in; control and first-fault
 // receipts remain active in the ordinary AlderLakeN profile.
 static bool display13TraceEnabled;
+// Bounded opt-in breadcrumbs. Kernel logs may not persist across a hard reset.
+static bool rplpBootTraceEnabled;
+static volatile uint32_t rplpBootTraceDDCReads;
+static volatile uint32_t rplpBootTraceFBEnableCalls;
 static XELPMemory::Layout xelpMemory;
 static uint16_t xelpMemoryGGC;
 static XELPMemory::Layout xelpPhysicalMemory(IOPCIDevice *pci) {
@@ -3849,6 +3853,9 @@ void XE::selectProfile(const XELP::Profile &profile) {
         display13FramebufferRequested=adlnKernelReady;
         adlnNativeRCSProfileRequested=adlnNativeRequested && !checkKernelArgument("-wex-adln-kernel-ctx");
         display13TraceEnabled=display13FramebufferRequested && checkKernelArgument("-wex-display13-trace");
+        rplpBootTraceEnabled=display13FramebufferRequested &&
+            profile.family==XELP::Family::RaptorLakeP && checkKernelArgument("-wex-rplp-boottrace");
+        if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 00 profile admitted");
         if(display13FramebufferRequested || adlnNativeRequested)currentFramebuffer=&kextIntelTGLFb;
         if(adlnNativeRequested) {
             tglRequested=tglAcceleratorRequested=true;currentGraphics=&kextIntelTGL;
@@ -5000,10 +5007,12 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	const uint8_t objectSize[] {0xB9,0x80,0,0,0},ownerStore[] {0x49,0x89,0x9D,0xC8,0,0,0};
 	known=known && !memcmp(reinterpret_cast<void *>(address+0x59D8E),objectSize,sizeof(objectSize)) &&
 		!memcmp(reinterpret_cast<void *>(address+0x3FE26),ownerStore,sizeof(ownerStore));
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 10 donor-compatible=%u",(unsigned)known);
 	if(!known)return false;
 	if(!display13FBPower.lock)display13FBPower.lock=IOLockAlloc();
 	KernelPatcher::RouteRequest start(symbols[7],wrapDisplay13FramebufferStart,orgDisplay13FramebufferStart);
 	const bool startRouted=patcher.routeMultiple(index,&start,1,address,size);patcher.clearError();
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 11 controller-start-route=%u",(unsigned)startRouted);
 	if(!startRouted)return false;
  // Apply DVMT calculation before routing FBMemMgr_Init: the common
  // module scans its native entry, not our later trampoline. Startup is
@@ -5017,6 +5026,9 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
   (modDVMTCalcFix.isApplied() && modDVMTCalcFix.bytes()==xelpMemory.bytes));
  uint64_t calc[] {1,ggc,nativeBytes,xelpMemory.bytes,needCalc,modDVMTCalcFix.enabled,modDVMTCalcFix.isApplied(),calcReady};
  IORegistryEntry::getRegistryRoot()->setProperty("N97DVMTCalcPolicy",calc,sizeof(calc));
+ if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 20 DVMT need=%u enabled=%u applied=%u ready=%u native=%llu stolen=%llu",
+  (unsigned)needCalc,(unsigned)modDVMTCalcFix.enabled,(unsigned)modDVMTCalcFix.isApplied(),(unsigned)calcReady,
+  (unsigned long long)nativeBytes,(unsigned long long)xelpMemory.bytes);
  if(!calcReady)return false;
  // The AlderLakeN entry bypasses processKextFull, which supplies the qualified
  // non-GuC frequency-query contract on TGL. Its native pmNotify is the same
@@ -5186,6 +5198,10 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	const bool backend=display13FBPowerBackendReady && display13FBClockReady && display13FBMemoryReady &&
 		display13FBIRQReady && display13FBWatermarkLayoutReady && display13FBOutputHooksReady && display13FBTopologyHooksReady;
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferBackendReady",backend);
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 30 backend=%u power=%u clock=%u memory=%u irq=%u output=%u topology=%u",
+	 (unsigned)backend,(unsigned)display13FBPowerBackendReady,(unsigned)display13FBClockReady,
+	 (unsigned)display13FBMemoryReady,(unsigned)display13FBIRQReady,
+	 (unsigned)display13FBOutputHooksReady,(unsigned)display13FBTopologyHooksReady);
 	return true; // Installed routes; actual startup/scanout still require runtime checks.
 }
 
@@ -7161,7 +7177,10 @@ static void adlnPublishFrontend(const char *name,const char *phase,uint64_t (&r)
 uint32_t XE::wrapDisplay13FBEnable(IOService *fb) {
     uint64_t r[16] {1,1};adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Enable","Entry",r);
     const auto result=FunctionCast(wrapDisplay13FBEnable,callbackXE->orgDisplay13FBEnable)(fb);
-    r[5]=result;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Enable","Last",r);return result;
+    r[5]=result;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Enable","Last",r);
+    if(rplpBootTraceEnabled && __sync_fetch_and_add(&rplpBootTraceFBEnableCalls,1U)<2)
+        SYSLOG("igfx","RPLP-BOOTTRACE 52 framebuffer-enable-return=%u",(unsigned)result);
+    return result;
 }
 uint32_t XE::wrapAlderLakeNConnectionAttr(IOService *fb,int connection,uint32_t attribute,unsigned long *value) {
     uint64_t r[16] {1,2,0,static_cast<uint32_t>(connection),attribute};
@@ -7191,6 +7210,9 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
             root->setProperty(block==1 ? "N97FBEDIDBase" : "N97FBEDIDExtension",data,128);
         }
         root->setProperty("N97FBPortDDCLast",r,sizeof(r));
+        if(rplpBootTraceEnabled && block==1 && __sync_fetch_and_add(&rplpBootTraceDDCReads,1U)<2)
+            SYSLOG("igfx","RPLP-BOOTTRACE 50 EDID-base return=%u checksum=%u",
+                (unsigned)result,(unsigned)r[4]);
     }
     return result;
 }
@@ -7282,6 +7304,8 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		s->display13FBBootHandoffHookReady && s->display13FBGTTHooksReady && s->display13FBMemoryReady && s->display13FBABIReady && s->display13FBTopologyHooksReady &&
 		pci && xelpAlderLakeNDevice(pci);
 	that->setProperty("N97FramebufferBackendReady",ready);
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 40 start-ready=%u internal-panel-A=%u",
+	 (unsigned)ready,(unsigned)s->firmwarePorts.internalPanelA());
 	if(!ready)return false;
 	auto property=provider->getProperty("xelp-hdmi-wiring");
     if(!property)property=provider->getProperty("tgl-hdmi-wiring");
@@ -7303,8 +7327,11 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	const bool loopSelected=provider->getWorkLoop() && features && mode &&
 		features->setObject("ThreadingMode",mode) && that->setProperty("FeatureControl",features);
 	OSSafeReleaseNULL(mode);OSSafeReleaseNULL(features);
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 41 workloop=%u",(unsigned)loopSelected);
 	if(!loopSelected)return false;
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 42 original-start-enter");
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgDisplay13FramebufferStart)(that,provider);
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 43 original-start-returned=%u",(unsigned)started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);
 	bool irqEnabled=false;
@@ -7329,6 +7356,11 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   }
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 44 accepted=%u irq=%u adopted=%u engine=%u fault=%u memoryFault=%u clockFault=%u wmFault=%u",
+	 (unsigned)accepted,(unsigned)irqEnabled,(unsigned)display13FBPower.bridge.bootAdopted,
+	 (unsigned)display13FBPower.engineEnabled,(unsigned)display13FBPower.bridge.state.faulted,
+	 (unsigned)display13FBPower.memoryFaulted,(unsigned)display13FBPower.clockFaulted,
+	 (unsigned)display13FBPower.watermarkFaulted);
 	return accepted;
 }
 
@@ -7458,6 +7490,8 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 	if(result.status!=Display13Power::Status::Complete && adlnIRQOwner(controller))wrapDisplay13FBDisableIRQ(controller);
 	adlnPublishPowerRecord("N97FBBootHandoff",record);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBBootHandoffCheck",check,sizeof(check));
+	if(rplpBootTraceEnabled)SYSLOG("igfx","RPLP-BOOTTRACE 51 handoff-status=%u adopted=%u fault=%u",
+	 (unsigned)result.status,(unsigned)c.bridge.bootAdopted,(unsigned)c.bridge.state.faulted);
 }
 
 bool XE::wrapAlderLakeNScanoutAllocate(IOService *fb) {
