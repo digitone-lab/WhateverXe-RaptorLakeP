@@ -187,7 +187,18 @@ inline Ports parse(const void *data,size_t length,Family family) {
         if(!(type&2))continue;
         const auto d=ddi(family,c[16]);
         if(d==PortCount){++r.unmapped;continue;}
-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+        if(r.present&(1U<<d)) {
+            // Katana BDB 249 describes eDP and an external DP child on
+            // the same Combo A/AUX A. Keep the panel for this known pair.
+            const auto &panel=r.port[d];
+            if(family==Family::RaptorLakeP && r.version==249 && stride==39 && d==0 &&
+                panel.type==0x1806 && panel.dvo==10 && panel.ddc==0x03 &&
+                panel.aux==0x40 && panel.flags==0xC0 && panel.capabilities==0 &&
+                u16(c)==0x0004 && type==0x68C6 && c[16]==10 && c[19]==0x01 &&
+                c[25]==0x40 && c[23]==0xC0 && c[33]==0)continue;
+            r.status=Status::Conflict;
+            return r;
+        }
         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
